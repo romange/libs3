@@ -1,10 +1,10 @@
 /** **************************************************************************
  * request.h
- * 
+ *
  * Copyright 2008 Bryan Ischo <bryan@ischo.com>
- * 
+ *
  * This file is part of libs3.
- * 
+ *
  * libs3 is free software: you can redistribute it and/or modify it under the
  * terms of the GNU General Public License as published by the Free Software
  * Foundation, version 3 of the License.
@@ -182,5 +182,7 @@ void request_finish(Request *request);
 // Convert a CURLE code to an S3Status
 S3Status request_curl_code_to_status(CURLcode code);
 
+S3Status request_init_iam();
+void request_iam_free();
 
 #endif /* REQUEST_H */

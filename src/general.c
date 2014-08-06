@@ -1,10 +1,10 @@
 /** **************************************************************************
  * general.c
- * 
+ *
  * Copyright 2008 Bryan Ischo <bryan@ischo.com>
- * 
+ *
  * This file is part of libs3.
- * 
+ *
  * libs3 is free software: you can redistribute it and/or modify it under the
  * terms of the GNU General Public License as published by the Free Software
  * Foundation, version 3 of the License.
@@ -31,6 +31,19 @@
 #include "util.h"
 
 static int initializeCountG = 0;
+
+S3Status S3_init_iam_role() {
+  static int initializeIamG = 0;
+
+  if (initializeIamG)
+    return S3StatusOK;
+  ++initializeIamG;
+  return request_init_iam();
+}
+
+void S3_free_iam_role() {
+  request_iam_free();
+}
 
 S3Status S3_initialize(const char *userAgentInfo, int flags,
                        const char *defaultS3HostName)
@@ -170,7 +183,7 @@ const char *S3_get_status_name(S3Status status)
         handlecase(ErrorUnexpectedContent);
         handlecase(ErrorUnresolvableGrantByEmailAddress);
         handlecase(ErrorUserKeyMustBeSpecified);
-        handlecase(ErrorUnknown);    
+        handlecase(ErrorUnknown);
         handlecase(HttpErrorMovedTemporarily);
         handlecase(HttpErrorBadRequest);
         handlecase(HttpErrorForbidden);
@@ -281,7 +294,7 @@ static S3Status convertAclXmlCallback(const char *elementPath,
 
     if (data) {
         if (!strcmp(elementPath, "AccessControlPolicy/Owner/ID")) {
-            caData->ownerIdLen += 
+            caData->ownerIdLen +=
                 snprintf(&(caData->ownerId[caData->ownerIdLen]),
                          S3_MAX_GRANTEE_USER_ID_SIZE - caData->ownerIdLen - 1,
                          "%.*s", dataLen, data);
@@ -291,18 +304,18 @@ static S3Status convertAclXmlCallback(const char *elementPath,
         }
         else if (!strcmp(elementPath, "AccessControlPolicy/Owner/"
                          "DisplayName")) {
-            caData->ownerDisplayNameLen += 
+            caData->ownerDisplayNameLen +=
                 snprintf(&(caData->ownerDisplayName
                            [caData->ownerDisplayNameLen]),
                          S3_MAX_GRANTEE_DISPLAY_NAME_SIZE -
-                         caData->ownerDisplayNameLen - 1, 
+                         caData->ownerDisplayNameLen - 1,
                          "%.*s", dataLen, data);
-            if (caData->ownerDisplayNameLen >= 
+            if (caData->ownerDisplayNameLen >=
                 S3_MAX_GRANTEE_DISPLAY_NAME_SIZE) {
                 return S3StatusUserDisplayNameTooLong;
             }
         }
-        else if (!strcmp(elementPath, 
+        else if (!strcmp(elementPath,
                     "AccessControlPolicy/AccessControlList/Grant/"
                     "Grantee/EmailAddress")) {
             // AmazonCustomerByEmail
@@ -368,7 +381,7 @@ static S3Status convertAclXmlCallback(const char *elementPath,
             else if (caData->userId[0] && caData->userDisplayName[0]) {
                 grant->granteeType = S3GranteeTypeCanonicalUser;
                 strcpy(grant->grantee.canonicalUser.id, caData->userId);
-                strcpy(grant->grantee.canonicalUser.displayName, 
+                strcpy(grant->grantee.canonicalUser.displayName,
                        caData->userDisplayName);
             }
             else if (caData->groupUri[0]) {
@@ -452,7 +465,7 @@ S3Status S3_convert_acl(char *aclXml, char *ownerId, char *ownerDisplayName,
     S3Status status = simplexml_add(&simpleXml, aclXml, strlen(aclXml));
 
     simplexml_deinitialize(&simpleXml);
-                                          
+
     return status;
 }
 
