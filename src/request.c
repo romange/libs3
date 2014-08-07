@@ -1,10 +1,10 @@
 /** **************************************************************************
  * request.c
- * 
+ *
  * Copyright 2008 Bryan Ischo <bryan@ischo.com>
- * 
+ *
  * This file is part of libs3.
- * 
+ *
  * libs3 is free software: you can redistribute it and/or modify it under the
  * terms of the GNU General Public License as published by the Free Software
  * Foundation, version 3 of the License.
@@ -23,6 +23,8 @@
  * <http://www.gnu.org/licenses/>.
  *
  ************************************************************************** **/
+
+#define _GNU_SOURCE
 
 #include <ctype.h>
 #include <pthread.h>
@@ -48,6 +50,11 @@ static int requestStackCountG;
 
 char defaultHostNameG[S3_MAX_HOSTNAME_SIZE];
 
+static char* iam_security_token = NULL;
+static char* iam_aws_access_key = NULL;
+static char* iam_aws_secret_key = NULL;
+static time_t iam_token_expires = 0;
+static pthread_mutex_t iam_mutex;
 
 typedef struct RequestComputedValues
 {
@@ -105,6 +112,8 @@ typedef struct RequestComputedValues
 
     // Authorization header
     char authorizationHeader[128];
+    char iamTokenHeader[800];
+    time_t now; // the time of the request.
 } RequestComputedValues;
 
 
@@ -123,7 +132,7 @@ static void request_headers_done(Request *request)
     // Get the http response code
     long httpResponseCode;
     request->httpResponseCode = 0;
-    if (curl_easy_getinfo(request->curl, CURLINFO_RESPONSE_CODE, 
+    if (curl_easy_getinfo(request->curl, CURLINFO_RESPONSE_CODE,
                           &httpResponseCode) != CURLE_OK) {
         // Not able to get the HTTP response code - error
         request->status = S3StatusInternalError;
@@ -133,7 +142,7 @@ static void request_headers_done(Request *request)
         request->httpResponseCode = httpResponseCode;
     }
 
-    response_headers_handler_done(&(request->responseHeadersHandler), 
+    response_headers_handler_done(&(request->responseHeadersHandler),
                                   request->curl);
 
     // Only make the callback if it was a successful request; otherwise we're
@@ -142,7 +151,7 @@ static void request_headers_done(Request *request)
         (request->httpResponseCode >= 200) &&
         (request->httpResponseCode <= 299)) {
         request->status = (*(request->propertiesCallback))
-            (&(request->responseHeadersHandler.responseProperties), 
+            (&(request->responseHeadersHandler.responseProperties),
              request->callbackData);
     }
 }
@@ -179,7 +188,7 @@ static size_t curl_read_func(void *ptr, size_t size, size_t nmemb, void *data)
     if (!request->toS3Callback || !request->toS3CallbackBytesRemaining) {
         return 0;
     }
-    
+
     // Don't tell the callback that we are willing to accept more data than we
     // really are
     if (len > request->toS3CallbackBytesRemaining) {
@@ -217,7 +226,7 @@ static size_t curl_write_func(void *ptr, size_t size, size_t nmemb,
     }
 
     // On HTTP error, we expect to parse an HTTP error response
-    if ((request->httpResponseCode < 200) || 
+    if ((request->httpResponseCode < 200) ||
         (request->httpResponseCode > 299)) {
         request->status = error_parser_add
             (&(request->errorParser), (char *) ptr, len);
@@ -234,6 +243,12 @@ static size_t curl_write_func(void *ptr, size_t size, size_t nmemb,
     }
 
     return ((request->status == S3StatusOK) ? len : 0);
+}
+
+static size_t curl_iam_func(void *ptr, size_t size, size_t nmemb, void* data) {
+  size_t len = size * nmemb;
+  memcpy(data, ptr, len);
+  return len;
 }
 
 
@@ -332,9 +347,9 @@ static S3Status compose_amz_headers(const RequestParams *params,
     }
 
     // Add the x-amz-date header
-    time_t now = time(NULL);
+    values->now = time(NULL);
     char date[64];
-    strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&now));
+    strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", gmtime(&values->now));
     headers_append(1, "x-amz-date: %s", date);
 
     if (params->httpRequestType == HttpRequestTypeCOPY) {
@@ -423,7 +438,7 @@ static S3Status compose_standard_headers(const RequestParams *params,
     // Cache-Control
     do_put_header("Cache-Control: %s", cacheControl, cacheControlHeader,
                   S3StatusBadCacheControl, S3StatusCacheControlTooLong);
-    
+
     // ContentType
     do_put_header("Content-Type: %s", contentType, contentTypeHeader,
                   S3StatusBadContentType, S3StatusContentTypeTooLong);
@@ -437,12 +452,12 @@ static S3Status compose_standard_headers(const RequestParams *params,
                   contentDispositionFilename, contentDispositionHeader,
                   S3StatusBadContentDispositionFilename,
                   S3StatusContentDispositionFilenameTooLong);
-    
+
     // ContentEncoding
-    do_put_header("Content-Encoding: %s", contentEncoding, 
+    do_put_header("Content-Encoding: %s", contentEncoding,
                   contentEncodingHeader, S3StatusBadContentEncoding,
                   S3StatusContentEncodingTooLong);
-    
+
     // Expires
     if (params->putProperties && (params->putProperties->expires >= 0)) {
         time_t t = (time_t) params->putProperties->expires;
@@ -476,28 +491,28 @@ static S3Status compose_standard_headers(const RequestParams *params,
     else {
         values->ifUnmodifiedSinceHeader[0] = 0;
     }
-    
+
     // If-Match header
     do_get_header("If-Match: %s", ifMatchETag, ifMatchHeader,
                   S3StatusBadIfMatchETag, S3StatusIfMatchETagTooLong);
-    
+
     // If-None-Match header
     do_get_header("If-None-Match: %s", ifNotMatchETag, ifNoneMatchHeader,
-                  S3StatusBadIfNotMatchETag, 
+                  S3StatusBadIfNotMatchETag,
                   S3StatusIfNotMatchETagTooLong);
-    
+
     // Range header
     if (params->startByte || params->byteCount) {
         if (params->byteCount) {
             snprintf(values->rangeHeader, sizeof(values->rangeHeader),
-                     "Range: bytes=%llu-%llu", 
+                     "Range: bytes=%llu-%llu",
                      (unsigned long long) params->startByte,
-                     (unsigned long long) (params->startByte + 
+                     (unsigned long long) (params->startByte +
                                            params->byteCount - 1));
         }
         else {
             snprintf(values->rangeHeader, sizeof(values->rangeHeader),
-                     "Range: bytes=%llu-", 
+                     "Range: bytes=%llu-",
                      (unsigned long long) params->startByte);
         }
     }
@@ -588,7 +603,7 @@ static void canonicalize_amz_headers(RequestComputedValues *values)
         const char *header = sortedHeaders[i];
         const char *c = header;
         // If the header names are the same, append the next value
-        if ((i > 0) && 
+        if ((i > 0) &&
             !strncmp(header, sortedHeaders[i - 1], lastHeaderLen)) {
             // Replacing the previous newline with a comma
             *(buffer - 1) = ',';
@@ -681,6 +696,38 @@ static const char *http_request_type_to_verb(HttpRequestType requestType)
     }
 }
 
+#if 0
+static char *replace_str(const char *str, const char *old, const char *new)
+{
+    char *ret, *r;
+    const char *p, *q;
+    size_t oldlen = strlen(old);
+    size_t count, retlen, newlen = strlen(new);
+
+    if (oldlen != newlen) {
+        for (count = 0, p = str; (q = strstr(p, old)) != NULL; p = q + oldlen)
+            count++;
+        /* this is undefined if p - str > PTRDIFF_MAX */
+        retlen = p - str + strlen(p) + count * (newlen - oldlen);
+    } else
+        retlen = strlen(str);
+
+    if ((ret = malloc(retlen + 1)) == NULL)
+        return NULL;
+
+    for (r = ret, p = str; (q = strstr(p, old)) != NULL; p = q + oldlen) {
+        /* this is undefined if q - p > PTRDIFF_MAX */
+        long l = q - p;
+        memcpy(r, p, l);
+        r += l;
+        memcpy(r, new, newlen);
+        r += newlen;
+    }
+    strcpy(r, p);
+
+    return ret;
+}
+#endif
 
 // Composes the Authorization header for the request
 static S3Status compose_auth_header(const RequestParams *params,
@@ -692,9 +739,11 @@ static S3Status compose_auth_header(const RequestParams *params,
     // 129 bytes for Content-Type + \n
     // 1 byte for empty Date + \n
     // CanonicalizedAmzHeaders & CanonicalizedResource
-    char signbuf[17 + 129 + 129 + 1 + 
+    char signbuf[17 + 129 + 129 + 1 +
                  (sizeof(values->canonicalizedAmzHeaders) - 1) +
                  (sizeof(values->canonicalizedResource) - 1) + 1];
+    // printf("sizeof signbuf %ld\n", sizeof(signbuf));
+
     int len = 0;
 
 #define signbuf_append(format, ...)                             \
@@ -706,33 +755,54 @@ static S3Status compose_auth_header(const RequestParams *params,
 
     // For MD5 and Content-Type, use the value in the actual header, because
     // it's already been trimmed
-    signbuf_append("%s\n", values->md5Header[0] ? 
+    signbuf_append("%s\n", values->md5Header[0] ?
                    &(values->md5Header[sizeof("Content-MD5: ") - 1]) : "");
 
     signbuf_append
-        ("%s\n", values->contentTypeHeader[0] ? 
+        ("%s\n", values->contentTypeHeader[0] ?
          &(values->contentTypeHeader[sizeof("Content-Type: ") - 1]) : "");
 
     signbuf_append("%s", "\n"); // Date - we always use x-amz-date
 
     signbuf_append("%s", values->canonicalizedAmzHeaders);
 
-    signbuf_append("%s", values->canonicalizedResource);
-
     // Generate an HMAC-SHA-1 of the signbuf
     unsigned char hmac[20];
 
-    HMAC_SHA1(hmac, (unsigned char *) params->bucketContext.secretAccessKey,
-              strlen(params->bucketContext.secretAccessKey),
+    const char* secret = params->bucketContext.secretAccessKey;
+    const char* access = params->bucketContext.accessKeyId;
+
+    if (secret == NULL || access == NULL) {
+      if (iam_aws_secret_key == NULL || iam_aws_access_key == NULL || iam_security_token == NULL)
+        return S3StatusErrorInvalidAccessKeyId;
+      if (iam_token_expires < values->now + 60) {
+        S3Status stat = request_init_iam();
+        if (stat != S3StatusOK)
+          return stat;
+      }
+      secret = iam_aws_secret_key;
+      access = iam_aws_access_key;
+      snprintf(values->iamTokenHeader, sizeof(values->iamTokenHeader),
+        "x-amz-security-token:%s", iam_security_token);
+      // printf("sectoken %s\n", values->iamTokenHeader);
+      signbuf_append("%s\n", values->iamTokenHeader);
+    }
+    signbuf_append("%s", values->canonicalizedResource);
+
+    /*char* debug_buf = replace_str(signbuf, "\n", "\\n");
+
+    printf("signed buf %s\n", debug_buf);
+    free(debug_buf);*/
+
+    HMAC_SHA1(hmac, (unsigned char *)secret, strlen(secret),
               (unsigned char *) signbuf, len);
 
     // Now base-64 encode the results
     char b64[((20 + 1) * 4) / 3];
     int b64Len = base64Encode(hmac, 20, b64);
-    
+
     snprintf(values->authorizationHeader, sizeof(values->authorizationHeader),
-             "Authorization: AWS %s:%.*s", params->bucketContext.accessKeyId,
-             b64Len, b64);
+             "Authorization: AWS %s:%.*s", access, b64Len, b64);
 
     return S3StatusOK;
 }
@@ -745,7 +815,7 @@ static S3Status compose_uri(char *buffer, int bufferSize,
                             const char *subResource, const char *queryParams)
 {
     int len = 0;
-    
+
 #define uri_append(fmt, ...)                                                 \
     do {                                                                     \
         len += snprintf(&(buffer[len]), bufferSize - len, fmt, __VA_ARGS__); \
@@ -754,13 +824,13 @@ static S3Status compose_uri(char *buffer, int bufferSize,
         }                                                                    \
     } while (0)
 
-    uri_append("http%s://", 
+    uri_append("http%s://",
                (bucketContext->protocol == S3ProtocolHTTP) ? "" : "s");
 
-    const char *hostName = 
+    const char *hostName =
         bucketContext->hostName ? bucketContext->hostName : defaultHostNameG;
 
-    if (bucketContext->bucketName && 
+    if (bucketContext->bucketName &&
         bucketContext->bucketName[0]) {
         if (bucketContext->uriStyle == S3UriStyleVirtualHost) {
             uri_append("%s.%s", bucketContext->bucketName, hostName);
@@ -776,16 +846,16 @@ static S3Status compose_uri(char *buffer, int bufferSize,
     uri_append("%s", "/");
 
     uri_append("%s", urlEncodedKey);
-    
+
     if (subResource && subResource[0]) {
         uri_append("?%s", subResource);
     }
-    
+
     if (queryParams) {
         uri_append("%s%s", (subResource && subResource[0]) ? "&" : "?",
                    queryParams);
     }
-    
+
     return S3StatusOK;
 }
 
@@ -805,18 +875,18 @@ static S3Status setup_curl(Request *request,
 
     // Debugging only
     // curl_easy_setopt_safe(CURLOPT_VERBOSE, 1);
-    
+
     // Set private data to request for the benefit of S3RequestContext
     curl_easy_setopt_safe(CURLOPT_PRIVATE, request);
-    
+
     // Set header callback and data
     curl_easy_setopt_safe(CURLOPT_HEADERDATA, request);
     curl_easy_setopt_safe(CURLOPT_HEADERFUNCTION, &curl_header_func);
-    
+
     // Set read callback, data, and readSize
     curl_easy_setopt_safe(CURLOPT_READFUNCTION, &curl_read_func);
     curl_easy_setopt_safe(CURLOPT_READDATA, request);
-    
+
     // Set write callback and data
     curl_easy_setopt_safe(CURLOPT_WRITEFUNCTION, &curl_write_func);
     curl_easy_setopt_safe(CURLOPT_WRITEDATA, request);
@@ -842,7 +912,7 @@ static S3Status setup_curl(Request *request,
     // I think this is useful - we don't need interactive performance, we need
     // to complete large operations quickly
     curl_easy_setopt_safe(CURLOPT_TCP_NODELAY, 1);
-    
+
     // Don't use Curl's 'netrc' feature
     curl_easy_setopt_safe(CURLOPT_NETRC, CURL_NETRC_IGNORED);
 
@@ -880,14 +950,14 @@ static S3Status setup_curl(Request *request,
         snprintf(header, sizeof(header), "Content-Length: %llu",
                  (unsigned long long) params->toS3CallbackTotalSize);
         request->headers = curl_slist_append(request->headers, header);
-        request->headers = curl_slist_append(request->headers, 
+        request->headers = curl_slist_append(request->headers,
                                              "Transfer-Encoding:");
     }
     else if (params->httpRequestType == HttpRequestTypeCOPY) {
-        request->headers = curl_slist_append(request->headers, 
+        request->headers = curl_slist_append(request->headers,
                                              "Transfer-Encoding:");
     }
-    
+
     append_standard_header(cacheControlHeader);
     append_standard_header(contentTypeHeader);
     append_standard_header(md5Header);
@@ -900,11 +970,12 @@ static S3Status setup_curl(Request *request,
     append_standard_header(ifNoneMatchHeader);
     append_standard_header(rangeHeader);
     append_standard_header(authorizationHeader);
+    append_standard_header(iamTokenHeader);
 
     // Append x-amz- headers
     int i;
     for (i = 0; i < values->amzHeadersCount; i++) {
-        request->headers = 
+        request->headers =
             curl_slist_append(request->headers, values->amzHeaders[i]);
     }
 
@@ -929,7 +1000,7 @@ static S3Status setup_curl(Request *request,
     default: // HttpRequestTypeGET
         break;
     }
-    
+
     return S3StatusOK;
 }
 
@@ -939,7 +1010,7 @@ static void request_deinitialize(Request *request)
     if (request->headers) {
         curl_slist_free_all(request->headers);
     }
-    
+
     error_parser_deinitialize(&(request->errorParser));
 
     // curl_easy_reset prevents connections from being re-used for some
@@ -950,12 +1021,12 @@ static void request_deinitialize(Request *request)
 }
 
 
-static S3Status request_get(const RequestParams *params, 
+static S3Status request_get(const RequestParams *params,
                             const RequestComputedValues *values,
                             Request **reqReturn)
 {
     Request *request = 0;
-    
+
     // Try to get one from the request stack.  We hold the lock for the
     // shortest time possible here.
     pthread_mutex_lock(&requestStackMutexG);
@@ -963,7 +1034,7 @@ static S3Status request_get(const RequestParams *params,
     if (requestStackCountG) {
         request = requestStackG[--requestStackCountG];
     }
-    
+
     pthread_mutex_unlock(&requestStackMutexG);
 
     // If we got one, deinitialize it for re-use
@@ -990,13 +1061,13 @@ static S3Status request_get(const RequestParams *params,
     request->status = S3StatusOK;
 
     S3Status status;
-                        
+
     // Start out with no headers
     request->headers = 0;
 
     // Compute the URL
     if ((status = compose_uri
-         (request->uri, sizeof(request->uri), 
+         (request->uri, sizeof(request->uri),
           &(params->bucketContext), values->urlEncodedKey,
           params->subResource, params->queryParams)) != S3StatusOK) {
         curl_easy_cleanup(request->curl);
@@ -1026,11 +1097,11 @@ static S3Status request_get(const RequestParams *params,
     response_headers_handler_initialize(&(request->responseHeadersHandler));
 
     request->propertiesCallbackMade = 0;
-    
+
     error_parser_initialize(&(request->errorParser));
 
     *reqReturn = request;
-    
+
     return S3StatusOK;
 }
 
@@ -1066,7 +1137,7 @@ static void request_release(Request *request)
 S3Status request_api_initialize(const char *userAgentInfo, int flags,
                                 const char *defaultHostName)
 {
-    if (curl_global_init(CURL_GLOBAL_ALL & 
+    if (curl_global_init(CURL_GLOBAL_ALL &
                          ~((flags & S3_INIT_WINSOCK) ? 0 : CURL_GLOBAL_WIN32))
         != CURLE_OK) {
         return S3StatusInternalError;
@@ -1076,7 +1147,7 @@ S3Status request_api_initialize(const char *userAgentInfo, int flags,
         defaultHostName = S3_DEFAULT_HOSTNAME;
     }
 
-    if (snprintf(defaultHostNameG, S3_MAX_HOSTNAME_SIZE, 
+    if (snprintf(defaultHostNameG, S3_MAX_HOSTNAME_SIZE,
                  "%s", defaultHostName) >= S3_MAX_HOSTNAME_SIZE) {
         return S3StatusUriTooLong;
     }
@@ -1097,14 +1168,15 @@ S3Status request_api_initialize(const char *userAgentInfo, int flags,
         platform[sizeof(platform) - 1] = 0;
     }
     else {
-        snprintf(platform, sizeof(platform), "%s%s%s", utsn.sysname, 
+        snprintf(platform, sizeof(platform), "%s%s%s", utsn.sysname,
                  utsn.machine[0] ? " " : "", utsn.machine);
     }
 
-    snprintf(userAgentG, sizeof(userAgentG), 
+    snprintf(userAgentG, sizeof(userAgentG),
              "Mozilla/4.0 (Compatible; %s; libs3 %s.%s; %s)",
              userAgentInfo, LIBS3_VER_MAJOR, LIBS3_VER_MINOR, platform);
-    
+
+    pthread_mutex_init(&iam_mutex, 0);
     return S3StatusOK;
 }
 
@@ -1130,11 +1202,12 @@ void request_perform(const RequestParams *params, S3RequestContext *context)
 
     // These will hold the computed values
     RequestComputedValues computed;
+    memset(&computed, 0, sizeof(computed));
 
     // Validate the bucket name
-    if (params->bucketContext.bucketName && 
+    if (params->bucketContext.bucketName &&
         ((status = S3_validate_bucket_name
-          (params->bucketContext.bucketName, 
+          (params->bucketContext.bucketName,
            params->bucketContext.uriStyle)) != S3StatusOK)) {
         return_status(status);
     }
@@ -1167,7 +1240,7 @@ void request_perform(const RequestParams *params, S3RequestContext *context)
     if ((status = compose_auth_header(params, &computed)) != S3StatusOK) {
         return_status(status);
     }
-    
+
     // Get an initialized Request structure now
     if ((status = request_get(params, &computed, &request)) != S3StatusOK) {
         return_status(status);
@@ -1213,11 +1286,11 @@ void request_finish(Request *request)
     // If we haven't detected this already, we now know that the headers are
     // definitely done being read in
     request_headers_done(request);
-    
+
     // If there was no error processing the request, then possibly there was
     // an S3 error parsed, which should be converted into the request status
     if (request->status == S3StatusOK) {
-        error_parser_convert_status(&(request->errorParser), 
+        error_parser_convert_status(&(request->errorParser),
                                     &(request->status));
         // If there still was no error recorded, then it is possible that
         // there was in fact an error but that there was no error XML
@@ -1243,7 +1316,7 @@ void request_finish(Request *request)
             case 400:
                 request->status = S3StatusHttpErrorBadRequest;
                 break;
-            case 403: 
+            case 403:
                 request->status = S3StatusHttpErrorForbidden;
                 break;
             case 404:
@@ -1342,7 +1415,7 @@ S3Status S3_generate_authenticated_query_string
     char canonicalizedResource[MAX_CANONICALIZED_RESOURCE_SIZE];
     canonicalize_resource(bucketContext->bucketName, resource, urlEncodedKey,
                           canonicalizedResource);
-                          
+
     // We allow for:
     // 17 bytes for HTTP-Verb + \n
     // 1 byte for empty Content-MD5 + \n
@@ -1380,8 +1453,8 @@ S3Status S3_generate_authenticated_query_string
 
     // Finally, compose the uri, with params:
     // ?AWSAccessKeyId=xxx[&Expires=]&Signature=xxx
-    char queryParams[sizeof("AWSAccessKeyId=") + 20 + 
-                     sizeof("&Expires=") + 20 + 
+    char queryParams[sizeof("AWSAccessKeyId=") + 20 +
+                     sizeof("&Expires=") + 20 +
                      sizeof("&Signature=") + sizeof(signature) + 1];
 
     sprintf(queryParams, "AWSAccessKeyId=%s&Expires=%ld&Signature=%s",
@@ -1389,4 +1462,92 @@ S3Status S3_generate_authenticated_query_string
 
     return compose_uri(buffer, S3_MAX_AUTHENTICATED_QUERY_STRING_SIZE,
                        bucketContext, urlEncodedKey, resource, queryParams);
+}
+
+
+S3Status request_init_iam() {
+  S3Status status = S3StatusInternalError;
+  CURL* curl = curl_easy_init();
+  if (!curl)
+    return status;
+
+#define CURL_OP(x) { CURLcode code = (x); \
+     if (code != CURLE_OK)  { \
+       fprintf(stderr, "curl error " #x "\n"); \
+       goto exit; \
+     } \
+     } while(0);
+
+  char file[128] = {};
+  char iam_url[512] = "169.254.169.254/latest/meta-data/iam/security-credentials/";
+  char data[1024];
+
+  CURL_OP(curl_easy_setopt(curl, CURLOPT_URL, iam_url));
+  CURL_OP(curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 2000));
+  CURL_OP(curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &curl_iam_func));
+  CURL_OP(curl_easy_setopt(curl, CURLOPT_WRITEDATA, file));
+  CURL_OP(curl_easy_perform(curl));
+  strcat(iam_url, file);
+
+  CURL_OP(curl_easy_setopt(curl, CURLOPT_URL, iam_url));
+  CURL_OP(curl_easy_setopt(curl, CURLOPT_WRITEDATA, data));
+  CURL_OP(curl_easy_perform(curl));
+
+
+  const char* start = NULL;
+  size_t len = 0;
+
+#define FIND_VAL_FOR_KEY(x) { start = strstr(data, x); \
+    if (start) { \
+      start += sizeof(x) - 1; \
+      len = strchr(start, '"') - start; } \
+     } while(0)
+
+  pthread_mutex_lock(&iam_mutex);
+  free(iam_aws_access_key);
+  free(iam_aws_secret_key);
+  free(iam_security_token);
+  iam_token_expires = 0;
+  iam_aws_access_key = iam_aws_secret_key = iam_security_token = NULL;
+  FIND_VAL_FOR_KEY("AccessKeyId\" : \"");
+  if (start) {
+    iam_aws_access_key = // strdup("ASIAIGCKWBCP4RKWASGA");
+     strndup(start, len);
+  }
+  FIND_VAL_FOR_KEY("SecretAccessKey\" : \"");
+  if (start) {
+    iam_aws_secret_key =  //strdup("pHrFdKHjqzQHANnK72/pAGWW0H8MhFl11TdOtM98");
+
+     strndup(start, len);
+  }
+
+  FIND_VAL_FOR_KEY("Token\" : \"");
+  if (start) {
+    iam_security_token =  //strdup("AQoDYXdzEKj//////////wEa0AMWMXs6ykBM8VsY+NuCkVkVbqJY3TXmW+zmff3ENxbzM0GjDFZTBa5c/cPeKLUOqn7YWMlTsqDWLTJFRR5KSVdsKUR8s61sf1s7/MTZk+q5Fdk38a2CoPxlEvvgbbkI+BBKigGW5JsRgOBrLkPkIBDMKFPHFBg+pZMaZSdBE9tIdru2E+N5TbTyk3DZTC5DJw+Vo3pD/kJOpHRWbyGEISYjeXqXHVYC2SHggw/3vo2SUM2eBmXRyb6YntMkYCn6oItH5FtKaF1sPYV+lp3LMquHCn4utIx2FQNVvvG96crgYhX7obGbiZhxFz02eauogKWuJi48nkyPa1md6O+klcTqtwHBMiP/9sb46HbANCgI0c5CDkmufiypjHr41xwd7MFxf4twQV+RJ0qfXZGmRHwx1ucI8OP/TriZQ0bXMAYuLSWmuSdSFCDmXZDydx7Q3xMio0bRqU7SLpNkcVqr0kld2yM28Rq0zhiHk8M8A+xnvXcWZNmPBt1mMVnVKcDXmSr+Yc18T1HJ1lvOfCthI18kdQ6m1PWYrnffSvRmdxqUON4gjnN/3GwXHSSgTRapqUXyS5n1uDChVygNz/uFHPYJIGhHZHDTZ2M5JH2O/4S1hiCu9oifBQ==");
+     strndup(start, len);
+  }
+  FIND_VAL_FOR_KEY("Token\" : \"");
+  FIND_VAL_FOR_KEY("Expiration\" : \"");
+  if (start) {
+    struct tm tm;
+    if (strptime(start, "%Y-%m-%dT%TZ", &tm)) {
+      iam_token_expires = mktime(&tm);
+    }
+  }
+  pthread_mutex_unlock(&iam_mutex);
+
+  if (iam_aws_access_key != NULL && iam_aws_secret_key != NULL && iam_security_token != NULL &&
+      iam_token_expires > 0) {
+    status = S3StatusOK;
+  }
+
+exit:
+  curl_easy_cleanup(curl);
+  return status;
+}
+
+void request_iam_free() {
+  free(iam_security_token);
+  free(iam_aws_access_key);
+  free(iam_aws_secret_key);
 }
