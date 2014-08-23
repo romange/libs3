@@ -245,10 +245,29 @@ static size_t curl_write_func(void *ptr, size_t size, size_t nmemb,
     return ((request->status == S3StatusOK) ? len : 0);
 }
 
+
+struct MemoryStruct {
+  char *memory;
+  size_t size;
+};
+
 static size_t curl_iam_func(void *ptr, size_t size, size_t nmemb, void* data) {
-  size_t len = size * nmemb;
-  memcpy(data, ptr, len);
-  return len;
+  size_t realsize = size * nmemb;
+  struct MemoryStruct* mem = (struct MemoryStruct *)data;
+
+  if (mem->size)
+    mem->memory = realloc(mem->memory, mem->size + realsize + 1);
+  else
+    mem->memory = malloc(realsize + 1);
+  if(mem->memory == NULL) {
+    /* out of memory! */
+    fprintf(stderr, "not enough memory (realloc returned NULL)\n");
+    return 0;
+  }
+
+  memcpy(&(mem->memory[mem->size]), ptr, realsize);
+  mem->size += realsize;
+  return realsize;
 }
 
 
@@ -1478,26 +1497,31 @@ S3Status request_init_iam() {
      } \
      } while(0);
 
-  char file[128] = {};
+  struct MemoryStruct file = {NULL, 0};
   char iam_url[512] = "169.254.169.254/latest/meta-data/iam/security-credentials/";
-  char data[1024];
+  struct MemoryStruct data = {NULL, 0};
 
   CURL_OP(curl_easy_setopt(curl, CURLOPT_URL, iam_url));
   CURL_OP(curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 2000));
   CURL_OP(curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &curl_iam_func));
-  CURL_OP(curl_easy_setopt(curl, CURLOPT_WRITEDATA, file));
+  CURL_OP(curl_easy_setopt(curl, CURLOPT_WRITEDATA, &file));
   CURL_OP(curl_easy_perform(curl));
-  strcat(iam_url, file);
+  strncat(iam_url, file.memory, file.size);
 
   CURL_OP(curl_easy_setopt(curl, CURLOPT_URL, iam_url));
-  CURL_OP(curl_easy_setopt(curl, CURLOPT_WRITEDATA, data));
+  CURL_OP(curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data));
   CURL_OP(curl_easy_perform(curl));
 
+  if (data.size < 20) {
+    fprintf(stderr, "bad data string %.*s", (int)data.size, data.memory);
+    goto exit;
+  }
+  data.memory[data.size] = 0;
 
   const char* start = NULL;
   size_t len = 0;
 
-#define FIND_VAL_FOR_KEY(x) { start = strstr(data, x); \
+#define FIND_VAL_FOR_KEY(x) { start = strstr(data.memory, x); \
     if (start) { \
       start += sizeof(x) - 1; \
       len = strchr(start, '"') - start; } \
@@ -1511,20 +1535,16 @@ S3Status request_init_iam() {
   iam_aws_access_key = iam_aws_secret_key = iam_security_token = NULL;
   FIND_VAL_FOR_KEY("AccessKeyId\" : \"");
   if (start) {
-    iam_aws_access_key = // strdup("ASIAIGCKWBCP4RKWASGA");
-     strndup(start, len);
+    iam_aws_access_key = strndup(start, len);
   }
   FIND_VAL_FOR_KEY("SecretAccessKey\" : \"");
   if (start) {
-    iam_aws_secret_key =  //strdup("pHrFdKHjqzQHANnK72/pAGWW0H8MhFl11TdOtM98");
-
-     strndup(start, len);
+    iam_aws_secret_key = strndup(start, len);
   }
 
   FIND_VAL_FOR_KEY("Token\" : \"");
   if (start) {
-    iam_security_token =  //strdup("AQoDYXdzEKj//////////wEa0AMWMXs6ykBM8VsY+NuCkVkVbqJY3TXmW+zmff3ENxbzM0GjDFZTBa5c/cPeKLUOqn7YWMlTsqDWLTJFRR5KSVdsKUR8s61sf1s7/MTZk+q5Fdk38a2CoPxlEvvgbbkI+BBKigGW5JsRgOBrLkPkIBDMKFPHFBg+pZMaZSdBE9tIdru2E+N5TbTyk3DZTC5DJw+Vo3pD/kJOpHRWbyGEISYjeXqXHVYC2SHggw/3vo2SUM2eBmXRyb6YntMkYCn6oItH5FtKaF1sPYV+lp3LMquHCn4utIx2FQNVvvG96crgYhX7obGbiZhxFz02eauogKWuJi48nkyPa1md6O+klcTqtwHBMiP/9sb46HbANCgI0c5CDkmufiypjHr41xwd7MFxf4twQV+RJ0qfXZGmRHwx1ucI8OP/TriZQ0bXMAYuLSWmuSdSFCDmXZDydx7Q3xMio0bRqU7SLpNkcVqr0kld2yM28Rq0zhiHk8M8A+xnvXcWZNmPBt1mMVnVKcDXmSr+Yc18T1HJ1lvOfCthI18kdQ6m1PWYrnffSvRmdxqUON4gjnN/3GwXHSSgTRapqUXyS5n1uDChVygNz/uFHPYJIGhHZHDTZ2M5JH2O/4S1hiCu9oifBQ==");
-     strndup(start, len);
+    iam_security_token = strndup(start, len);
   }
   FIND_VAL_FOR_KEY("Token\" : \"");
   FIND_VAL_FOR_KEY("Expiration\" : \"");
@@ -1543,6 +1563,8 @@ S3Status request_init_iam() {
 
 exit:
   curl_easy_cleanup(curl);
+  free(file.memory);
+  free(data.memory);
   return status;
 }
 
