@@ -715,39 +715,6 @@ static const char *http_request_type_to_verb(HttpRequestType requestType)
     }
 }
 
-#if 0
-static char *replace_str(const char *str, const char *old, const char *new)
-{
-    char *ret, *r;
-    const char *p, *q;
-    size_t oldlen = strlen(old);
-    size_t count, retlen, newlen = strlen(new);
-
-    if (oldlen != newlen) {
-        for (count = 0, p = str; (q = strstr(p, old)) != NULL; p = q + oldlen)
-            count++;
-        /* this is undefined if p - str > PTRDIFF_MAX */
-        retlen = p - str + strlen(p) + count * (newlen - oldlen);
-    } else
-        retlen = strlen(str);
-
-    if ((ret = malloc(retlen + 1)) == NULL)
-        return NULL;
-
-    for (r = ret, p = str; (q = strstr(p, old)) != NULL; p = q + oldlen) {
-        /* this is undefined if q - p > PTRDIFF_MAX */
-        long l = q - p;
-        memcpy(r, p, l);
-        r += l;
-        memcpy(r, new, newlen);
-        r += newlen;
-    }
-    strcpy(r, p);
-
-    return ret;
-}
-#endif
-
 // Composes the Authorization header for the request
 static S3Status compose_auth_header(const RequestParams *params,
                                     RequestComputedValues *values)
@@ -1499,15 +1466,23 @@ S3Status request_init_iam() {
 
   struct MemoryStruct file = {NULL, 0};
   char iam_url[512] = "169.254.169.254/latest/meta-data/iam/security-credentials/";
-  struct MemoryStruct data = {NULL, 0};
+  long http_response_code = 0;
 
   CURL_OP(curl_easy_setopt(curl, CURLOPT_URL, iam_url));
   CURL_OP(curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 2000));
   CURL_OP(curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &curl_iam_func));
   CURL_OP(curl_easy_setopt(curl, CURLOPT_WRITEDATA, &file));
   CURL_OP(curl_easy_perform(curl));
+  CURL_OP(curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_response_code));
+
+  if (http_response_code != 200 || file.size > 400) {
+    status = S3StatusBadMetaData;
+    goto exit;
+  }
+
   strncat(iam_url, file.memory, file.size);
 
+  struct MemoryStruct data = {NULL, 0};
   CURL_OP(curl_easy_setopt(curl, CURLOPT_URL, iam_url));
   CURL_OP(curl_easy_setopt(curl, CURLOPT_WRITEDATA, &data));
   CURL_OP(curl_easy_perform(curl));
